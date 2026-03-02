@@ -15,9 +15,18 @@ from flash_head.audio_analysis.wav2vec2 import Wav2Vec2Model
 from flash_head.utils.utils import match_and_blend_colors_torch, resize_and_centercrop
 from flash_head.utils.facecrop import process_image
 
-# compile models to speedup inference
-COMPILE_MODEL = True
-COMPILE_VAE = True
+def _env_bool(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Windows lacks Triton by default; keep compile off unless explicitly enabled.
+# Linux defaults to compile on for better throughput.
+_is_windows = os.name == "nt"
+COMPILE_MODEL = _env_bool("FLASHHEAD_COMPILE_MODEL", default=not _is_windows)
+COMPILE_VAE = _env_bool("FLASHHEAD_COMPILE_VAE", default=not _is_windows)
 # use parallel vae to speedup decode/encode, only support WanVAE
 USE_PARALLEL_VAE = True
 

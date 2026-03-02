@@ -73,14 +73,26 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
         elif pretrained_model_name_or_path.is_dir():
             config_path = pretrained_model_name_or_path / "config.json"
             with open(config_path, "r") as f:
-                config = make_hashable_key(json.load(f))
+                config_hashable = make_hashable_key(json.load(f))
 
-            assert config in diffusers_and_ours_config_mapping, (
-                "Provided diffusers checkpoint config for VAE is not suppported. "
-                "We only support diffusers configs found in Lightricks/LTX-Video."
-            )
-
-            config = diffusers_and_ours_config_mapping[config]
+            # 检查配置是否支持
+            if config_hashable not in diffusers_and_ours_config_mapping:
+                # 尝试直接使用原始配置（兼容模式）
+                with open(config_path, "r") as f:
+                    config_raw = json.load(f)
+                if config_raw.get("_class_name") == "AutoencoderKLLTXVideo":
+                    # 使用预定义的映射配置
+                    from flash_head.ltx_video.utils.diffusers_config_mapping import OURS_VAE_CONFIG
+                    config = OURS_VAE_CONFIG
+                else:
+                    raise ValueError(
+                        f"Provided diffusers checkpoint config for VAE is not supported. "
+                        f"Config _class_name: {config_raw.get('_class_name', 'unknown')}. "
+                        f"We only support diffusers configs found in Lightricks/LTX-Video."
+                    )
+            else:
+                # 使用映射后的配置
+                config = diffusers_and_ours_config_mapping[config_hashable]
 
             state_dict_path = (
                 pretrained_model_name_or_path
@@ -91,6 +103,8 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
             with safe_open(state_dict_path, framework="pt", device="cpu") as f:
                 for k in f.keys():
                     state_dict[k] = f.get_tensor(k)
+            
+            # 重命名状态字典的键
             for key in list(state_dict.keys()):
                 new_key = key
                 for replace_key, rename_key in VAE_KEYS_RENAME_DICT.items():
@@ -110,6 +124,24 @@ class CausalVideoAutoencoder(AutoencoderKLWrapper):
                     state_dict[k] = f.get_tensor(k)
             configs = json.loads(metadata["config"])
             config = configs["vae"]
+        
+        else:
+            # 默认情况：尝试从目录加载
+            config_path = pretrained_model_name_or_path / "config.json"
+            if config_path.exists():
+                with open(config_path, "r") as f:
+                    config_raw = json.load(f)
+                if config_raw.get("_class_name") == "AutoencoderKLLTXVideo":
+                    from flash_head.ltx_video.utils.diffusers_config_mapping import OURS_VAE_CONFIG
+                    config = OURS_VAE_CONFIG
+                else:
+                    raise ValueError(f"Unsupported VAE config: {config_raw.get('_class_name')}")
+            else:
+                raise ValueError(f"Cannot find config.json in {pretrained_model_name_or_path}")
+
+        # 确保 config 已定义
+        if 'config' not in locals():
+            raise ValueError("Failed to load VAE config")
 
         video_vae = cls.from_config(config)
         if "torch_dtype" in kwargs:

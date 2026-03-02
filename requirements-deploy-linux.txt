@@ -1,0 +1,17 @@
+# Ubuntu 22.04 + Python 3.10 + CUDA 12.8 deployment requirements
+# 1) Install torch/cu128 and flash-attn first (see README_WEB.md)
+# 2) Then install this file
+
+-r requirements.txt
+
+# Web service runtime dependencies
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+websockets>=12.0
+edge-tts>=7.0.0
+pydantic>=2.0.0
+python-multipart>=0.0.9
+loguru>=0.7.0
+pydub>=0.25.1
+numpy>=1.24.0
+Pillow>=10.0.0

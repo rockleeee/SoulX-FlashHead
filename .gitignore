@@ -7,3 +7,7 @@ examples/
 sample_results/
 models/
 tools/
+backend/venv/
+frontend/node_modules/
+frontend/dist/
+backend/logs/

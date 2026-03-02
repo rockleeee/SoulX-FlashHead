@@ -1,9 +1,14 @@
-opencv-python>=4.12.0.88
+# 核心 FlashHead 模型依赖
+# 按照官方 README 安装
+
+# 基础依赖
 opencv-python-headless>=4.12.0.88
+opencv-python>=4.12.0.88; platform_system == "Windows"
 diffusers>=0.34.0
 transformers==4.57.3
 tokenizers>=0.20.3
 accelerate>=1.8.1
+PyYAML>=6.0.0
 tqdm
 imageio
 easydict
@@ -11,12 +16,13 @@ ftfy
 imageio-ffmpeg
 scikit-image   
 loguru
-gradio>=5.0.0
 xfuser>=0.4.3
 pyloudnorm
 decord
 xformers==0.0.31
 librosa
 mediapipe==0.10.9
-flask
-nvidia-nccl-cu12==2.27.3
+einops>=0.8.0
+
+# 可选：Gradio（用于快速测试，不需要可删除）
+# gradio>=5.0.0
