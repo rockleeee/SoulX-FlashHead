@@ -258,14 +258,21 @@ class StreamContext:
     stream_id: str
     frame_seq: int = 0
     total_frames: int = 0
+    video_frame_sent_count: int = 0
+    source_frame_idx: int = 0
+    last_video_pts_ms: int = -1
+    frame_pts_monotonic_ok: bool = True
     source_fps: int = 25
     target_fps: int = 25
     frame_stride: int = 1
     output_fps: float = 25.0
-    generated_frame_count: int = 0
     stream_start_ts: float = 0.0
     first_frame_latency_ms: int = -1
     chunk_ms: int = config.AUDIO_CHUNK_MS_DEFAULT
+    audio_chunk_seq: int = 0
+    audio_chunk_sent_count: int = 0
+    audio_chunk_duration_ms: int = 0
+    total_audio_ms: int = 0
     cancelled: bool = False
     closed: bool = False
 
@@ -293,6 +300,7 @@ async def stream_worker(ctx: StreamContext):
                         "type": "stream.done",
                         "total_frames": ctx.total_frames,
                         "elapsed_ms": int((time.perf_counter() - ctx.stream_start_ts) * 1000) if ctx.stream_start_ts else 0,
+                        "total_audio_ms": ctx.total_audio_ms,
                         "cancelled": True,
                     },
                 )
@@ -300,6 +308,17 @@ async def stream_worker(ctx: StreamContext):
                     ctx.closed = True
                     return
                 logger.info(f"[sid={ctx.stream_id}] stream cancelled")
+                ctx.stream_start_ts = 0.0
+                ctx.frame_seq = 0
+                ctx.total_frames = 0
+                ctx.video_frame_sent_count = 0
+                ctx.source_frame_idx = 0
+                ctx.last_video_pts_ms = -1
+                ctx.frame_pts_monotonic_ok = True
+                ctx.audio_chunk_seq = 0
+                ctx.audio_chunk_sent_count = 0
+                ctx.audio_chunk_duration_ms = 0
+                ctx.total_audio_ms = 0
                 continue
 
             if kind != "audio":
@@ -308,7 +327,6 @@ async def stream_worker(ctx: StreamContext):
             if ctx.stream_start_ts == 0.0:
                 ctx.stream_start_ts = time.perf_counter()
                 ctx.cancelled = False
-                ctx.generated_frame_count = 0
                 ctx.first_frame_latency_ms = -1
 
             audio_chunk = item.get("audio", np.array([], dtype=np.float32))
@@ -328,9 +346,20 @@ async def stream_worker(ctx: StreamContext):
 
             if isinstance(frames, np.ndarray) and frames.size > 0:
                 for frame in frames:
-                    if ctx.frame_stride > 1 and (ctx.generated_frame_count % ctx.frame_stride) != 0:
-                        ctx.generated_frame_count += 1
+                    source_frame_idx = ctx.source_frame_idx
+                    frame_pts_ms = int(round(source_frame_idx * 1000.0 / max(1, ctx.source_fps)))
+                    ctx.source_frame_idx += 1
+
+                    if ctx.frame_stride > 1 and (source_frame_idx % ctx.frame_stride) != 0:
                         continue
+
+                    if ctx.last_video_pts_ms >= 0 and frame_pts_ms < ctx.last_video_pts_ms:
+                        ctx.frame_pts_monotonic_ok = False
+                        logger.error(
+                            f"[sid={ctx.stream_id}] frame pts rollback: prev={ctx.last_video_pts_ms}, cur={frame_pts_ms}"
+                        )
+                    ctx.last_video_pts_ms = frame_pts_ms
+
                     frame_base64 = encode_frame_to_base64_jpeg(frame, config.JPEG_QUALITY)
                     seq = ctx.frame_seq
                     is_key = seq % 25 == 0
@@ -339,7 +368,7 @@ async def stream_worker(ctx: StreamContext):
                         {
                             "type": "video.frame",
                             "seq": seq,
-                            "ts": int(time.time() * 1000),
+                            "pts_ms": frame_pts_ms,
                             "is_key": is_key,
                             "fps": ctx.output_fps,
                             "data": frame_base64,
@@ -353,7 +382,7 @@ async def stream_worker(ctx: StreamContext):
                         logger.info(f"[sid={ctx.stream_id}] first_frame_latency_ms={ctx.first_frame_latency_ms}")
                     ctx.frame_seq += 1
                     ctx.total_frames += 1
-                    ctx.generated_frame_count += 1
+                    ctx.video_frame_sent_count += 1
 
             if flush:
                 elapsed_ms = int((time.perf_counter() - ctx.stream_start_ts) * 1000) if ctx.stream_start_ts else 0
@@ -364,7 +393,11 @@ async def stream_worker(ctx: StreamContext):
                     f"[sid={ctx.stream_id}] stream.done: total_frames={ctx.total_frames}, elapsed_ms={elapsed_ms}, "
                     f"target_fps={ctx.target_fps}, output_fps={ctx.output_fps:.3f}, stride={ctx.frame_stride}, "
                     f"effective_gen_fps={effective_gen_fps:.3f}, real_time_ratio={real_time_ratio:.3f}, "
-                    f"cancelled={ctx.cancelled}, "
+                    f"cancelled={ctx.cancelled}, total_audio_ms={ctx.total_audio_ms}, "
+                    f"audio_chunk_sent_count={ctx.audio_chunk_sent_count}, "
+                    f"audio_chunk_duration_ms={ctx.audio_chunk_duration_ms}, "
+                    f"video_frame_sent_count={ctx.video_frame_sent_count}, "
+                    f"frame_pts_monotonic_ok={ctx.frame_pts_monotonic_ok}, "
                     f"first_frame_latency_ms={ctx.first_frame_latency_ms}"
                 )
                 sent = await safe_send_json(
@@ -373,6 +406,7 @@ async def stream_worker(ctx: StreamContext):
                         "type": "stream.done",
                         "total_frames": ctx.total_frames,
                         "elapsed_ms": elapsed_ms,
+                        "total_audio_ms": ctx.total_audio_ms,
                         "fps": ctx.output_fps,
                         "effective_gen_fps": effective_gen_fps,
                         "real_time_ratio": real_time_ratio,
@@ -385,21 +419,33 @@ async def stream_worker(ctx: StreamContext):
                 ctx.stream_start_ts = 0.0
                 ctx.total_frames = 0
                 ctx.frame_seq = 0
-                ctx.generated_frame_count = 0
+                ctx.video_frame_sent_count = 0
+                ctx.source_frame_idx = 0
+                ctx.last_video_pts_ms = -1
+                ctx.frame_pts_monotonic_ok = True
+                ctx.audio_chunk_seq = 0
+                ctx.audio_chunk_sent_count = 0
+                ctx.audio_chunk_duration_ms = 0
+                ctx.total_audio_ms = 0
     except (asyncio.CancelledError, WebSocketDisconnect):
         logger.info(f"[sid={ctx.stream_id}] stream_worker cancelled/disconnected")
         return
 
 
-async def enqueue_audio(ctx: StreamContext, audio_chunk: np.ndarray, flush: bool = False) -> bool:
+async def enqueue_audio(
+    ctx: StreamContext,
+    audio_chunk: np.ndarray,
+    flush: bool = False,
+    wait_if_full: bool = False,
+) -> bool:
     if ctx.closed:
         return False
 
-    if flush and ctx.queue.full():
+    if (flush or wait_if_full) and ctx.queue.full():
         # Never drop a flush marker, otherwise stream.done may never be emitted.
         wait_start = time.perf_counter()
         logger.warning(
-            f"[sid={ctx.stream_id}] queue full before flush, waiting: "
+            f"[sid={ctx.stream_id}] queue full before enqueue, waiting: "
             f"queue_depth={ctx.queue.qsize()}, chunk_ms={ctx.chunk_ms}"
         )
         while ctx.queue.full():
@@ -408,7 +454,7 @@ async def enqueue_audio(ctx: StreamContext, audio_chunk: np.ndarray, flush: bool
             await asyncio.sleep(0.005)
         wait_ms = int((time.perf_counter() - wait_start) * 1000)
         logger.info(
-            f"[sid={ctx.stream_id}] flush enqueue resumed after {wait_ms}ms: "
+            f"[sid={ctx.stream_id}] enqueue resumed after {wait_ms}ms: "
             f"queue_depth={ctx.queue.qsize()}"
         )
 
@@ -451,6 +497,14 @@ def clamp_target_fps(target_fps: Any, source_fps: int) -> int:
         fps = source_fps
     fps = max(1, min(source_fps, fps))
     return fps
+
+
+def clamp_chunk_ms(chunk_ms: Any) -> int:
+    try:
+        v = int(chunk_ms)
+    except (TypeError, ValueError):
+        v = 40
+    return max(20, min(40, v))
 
 
 @app.get("/")
@@ -633,7 +687,7 @@ async def avatar_websocket(websocket: WebSocket):
             if msg_type in {"tts.request", "text"}:
                 text = (message.get("text") or "").strip()
                 voice = message.get("voice")
-                chunk_ms = int(message.get("chunk_ms", config.AUDIO_CHUNK_MS_DEFAULT))
+                chunk_ms = clamp_chunk_ms(message.get("chunk_ms", 40))
                 ctx.chunk_ms = chunk_ms
                 requested_fps = message.get("render_fps", ctx.source_fps)
                 ctx.target_fps = clamp_target_fps(requested_fps, ctx.source_fps)
@@ -654,28 +708,17 @@ async def avatar_websocket(websocket: WebSocket):
                     if voice and state.tts and voice != state.tts.voice:
                         state.tts = TTSEngine(voice=voice)
                     audio_array = await state.tts.text_to_speech(text)
+                    ctx.audio_chunk_seq = 0
+                    ctx.audio_chunk_sent_count = 0
+                    ctx.audio_chunk_duration_ms = 0
+                    ctx.total_audio_ms = int(round(len(audio_array) * 1000.0 / config.AUDIO_SAMPLE_RATE))
+                    ctx.frame_pts_monotonic_ok = True
+                    ctx.last_video_pts_ms = -1
+                    ctx.source_frame_idx = 0
+                    ctx.video_frame_sent_count = 0
                     logger.info(
                         f"[sid={ctx.stream_id}] tts.request accepted: chars={len(text)}, audio_samples={len(audio_array)}, "
                         f"chunk_ms={chunk_ms}, target_fps={ctx.target_fps}, stride={ctx.frame_stride}"
-                    )
-
-                    # Send audio to frontend for real-time playback.
-                    audio_bytes = (audio_array * 32768.0).astype(np.int16).tobytes()
-                    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-                    sent = await safe_send_json(
-                        websocket,
-                        {
-                            "type": "audio.pcm",
-                            "sample_rate": config.AUDIO_SAMPLE_RATE,
-                            "encoding": "pcm_s16le",
-                            "data": audio_base64,
-                        },
-                    )
-                    if not sent:
-                        raise WebSocketDisconnect(code=1006)
-                    logger.info(
-                        f"[sid={ctx.stream_id}] audio.pcm sent: bytes={len(audio_bytes)}, "
-                        f"samples={len(audio_array)}"
                     )
 
                     chunks = chunk_audio(audio_array, chunk_ms=chunk_ms, sample_rate=config.AUDIO_SAMPLE_RATE)
@@ -683,9 +726,36 @@ async def avatar_websocket(websocket: WebSocket):
                         f"[sid={ctx.stream_id}] audio chunked: chunks={len(chunks)}, "
                         f"sample_rate={config.AUDIO_SAMPLE_RATE}"
                     )
+                    consumed_samples = 0
                     for chunk in chunks:
-                        if not await enqueue_audio(ctx, chunk.astype(np.float32), flush=False):
+                        chunk = np.asarray(chunk, dtype=np.float32)
+                        chunk_samples = int(chunk.shape[0])
+                        if chunk_samples <= 0:
+                            continue
+                        chunk_pts_ms = int(round(consumed_samples * 1000.0 / config.AUDIO_SAMPLE_RATE))
+                        chunk_duration_ms = int(round(chunk_samples * 1000.0 / config.AUDIO_SAMPLE_RATE))
+                        chunk_i16 = np.clip(chunk * 32768.0, -32768.0, 32767.0).astype(np.int16)
+                        chunk_base64 = base64.b64encode(chunk_i16.tobytes()).decode("utf-8")
+                        if not await enqueue_audio(ctx, chunk, flush=False, wait_if_full=True):
                             raise WebSocketDisconnect(code=1006)
+                        sent = await safe_send_json(
+                            websocket,
+                            {
+                                "type": "audio.chunk",
+                                "seq": ctx.audio_chunk_seq,
+                                "pts_ms": chunk_pts_ms,
+                                "duration_ms": chunk_duration_ms,
+                                "sample_rate": config.AUDIO_SAMPLE_RATE,
+                                "encoding": "pcm_s16le",
+                                "data": chunk_base64,
+                            },
+                        )
+                        if not sent:
+                            raise WebSocketDisconnect(code=1006)
+                        ctx.audio_chunk_seq += 1
+                        ctx.audio_chunk_sent_count += 1
+                        ctx.audio_chunk_duration_ms += chunk_duration_ms
+                        consumed_samples += chunk_samples
                     if not await enqueue_audio(ctx, np.array([], dtype=np.float32), flush=True):
                         raise WebSocketDisconnect(code=1006)
                 except WebSocketDisconnect:

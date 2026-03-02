@@ -146,10 +146,12 @@ flash_head_web/
   "type": "tts.request",
   "text": "你好，欢迎使用",
   "voice": "zh-CN-XiaoxiaoNeural",
-  "chunk_ms": 80,
+  "chunk_ms": 40,
   "render_fps": 5
 }
 ```
+
+`chunk_ms` 会在后端被强制限制在 `20~40` 毫秒。
 
 **接收消息格式：**
 ```json
@@ -161,9 +163,12 @@ flash_head_web/
   "dropped": false
 }
 
-// 音频
+// 音频分片（20-40ms）
 {
-  "type": "audio.pcm",
+  "type": "audio.chunk",
+  "seq": 0,
+  "pts_ms": 0,
+  "duration_ms": 40,
   "sample_rate": 16000,
   "encoding": "pcm_s16le",
   "data": "base64_pcm16"
@@ -174,7 +179,7 @@ flash_head_web/
   "type": "video.frame",
   "data": "base64_encoded_jpeg",
   "seq": 0,
-  "ts": 1772280000000,
+  "pts_ms": 0,
   "is_key": true,
   "fps": 5.0
 }
@@ -184,6 +189,7 @@ flash_head_web/
   "type": "stream.done",
   "total_frames": 33,
   "elapsed_ms": 5200,
+  "total_audio_ms": 2620,
   "fps": 5.0,
   "effective_gen_fps": 3.8,
   "real_time_ratio": 0.76,

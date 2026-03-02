@@ -24,14 +24,17 @@ type StreamAckMessage = {
 type VideoFrameMessage = {
   type: 'video.frame';
   seq: number;
-  ts: number;
+  pts_ms: number;
   is_key: boolean;
   fps?: number;
   data: string;
 };
 
-type AudioPcmMessage = {
-  type: 'audio.pcm';
+type AudioChunkMessage = {
+  type: 'audio.chunk';
+  seq: number;
+  pts_ms: number;
+  duration_ms: number;
   sample_rate: number;
   encoding: 'pcm_s16le';
   data: string;
@@ -41,6 +44,7 @@ type StreamDoneMessage = {
   type: 'stream.done';
   total_frames: number;
   elapsed_ms: number;
+  total_audio_ms?: number;
   fps?: number;
   effective_gen_fps?: number;
   real_time_ratio?: number;
@@ -59,11 +63,17 @@ type WsMessage =
   | SessionErrorMessage
   | StreamAckMessage
   | VideoFrameMessage
-  | AudioPcmMessage
+  | AudioChunkMessage
   | StreamDoneMessage
   | ErrorMessage;
 
 type PlayMode = 'realtime' | 'stable';
+
+type QueuedFrame = {
+  seq: number;
+  ptsMs: number;
+  data: string;
+};
 
 const VOICES = [
   { id: 'zh-CN-XiaoxiaoNeural', name: '晓晓 (女声，温柔)' },
@@ -74,7 +84,11 @@ const VOICES = [
 
 const DEFAULT_RENDER_FPS = 5;
 const MAX_BUFFERED_FRAMES = 300;
+const AUDIO_CHUNK_MS = 40;
 const STABLE_SYNC_START_DELAY_MS = 120;
+const REALTIME_SYNC_START_DELAY_MS = 80;
+const VIDEO_LATE_DROP_MS = 80;
+const VIDEO_EARLY_RENDER_MS = 20;
 
 function App() {
   const [text, setText] = useState('');
@@ -92,28 +106,36 @@ function App() {
   const [renderFps, setRenderFps] = useState(DEFAULT_RENDER_FPS);
   const [effectiveGenFps, setEffectiveGenFps] = useState(0);
   const [realTimeRatio, setRealTimeRatio] = useState(0);
+  const [audioNowMs, setAudioNowMs] = useState(0);
+  const [videoQueueLen, setVideoQueueLen] = useState(0);
+  const [droppedFrames, setDroppedFrames] = useState(0);
+  const [lateAudioChunks, setLateAudioChunks] = useState(0);
+  const [syncOffsetEstimateMs, setSyncOffsetEstimateMs] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const frameQueueRef = useRef<string[]>([]);
-  const stableFramesRef = useRef<string[]>([]);
+  const frameQueueRef = useRef<QueuedFrame[]>([]);
+  const stableFramesRef = useRef<QueuedFrame[]>([]);
+  const stableAudioChunksRef = useRef<AudioChunkMessage[]>([]);
+  const pendingRealtimeAudioChunksRef = useRef<AudioChunkMessage[]>([]);
   const renderTimerRef = useRef<number | null>(null);
-  const renderStartTimerRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const shouldReconnectRef = useRef<boolean>(true);
   const lastRenderTsRef = useRef<number>(0);
   const fpsSamplesRef = useRef<number[]>([]);
   const lastTextRef = useRef<string>('');
   const renderFpsRef = useRef<number>(DEFAULT_RENDER_FPS);
-  const serverFpsRef = useRef<number>(DEFAULT_RENDER_FPS);
   const selectedVoiceRef = useRef<string>('zh-CN-XiaoxiaoNeural');
   const playModeRef = useRef<PlayMode>('realtime');
   const streamStateRef = useRef<'idle' | 'streaming'>('idle');
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const pendingAudioRef = useRef<{ data: string; sampleRate: number } | null>(null);
-  const audioStartedRef = useRef<boolean>(false);
   const firstFrameSeenRef = useRef<boolean>(false);
+  const droppedFramesRef = useRef<number>(0);
+  const lateAudioChunksRef = useRef<number>(0);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const audioSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const audioBaseCtxTimeSecRef = useRef<number | null>(null);
+  const audioBasePtsMsRef = useRef<number>(0);
+  const nextAudioScheduleTimeSecRef = useRef<number>(0);
 
   const drawFrame = useCallback((jpegBase64: string) => {
     const canvas = canvasRef.current;
@@ -128,11 +150,23 @@ function App() {
     img.src = `data:image/jpeg;base64,${jpegBase64}`;
   }, []);
 
-  const stopRenderLoop = useCallback(() => {
-    if (renderStartTimerRef.current !== null) {
-      window.clearTimeout(renderStartTimerRef.current);
-      renderStartTimerRef.current = null;
+  const stopAllAudioSources = useCallback(() => {
+    for (const source of audioSourcesRef.current) {
+      try {
+        source.stop(0);
+      } catch {
+        // ignore
+      }
+      try {
+        source.disconnect();
+      } catch {
+        // ignore
+      }
     }
+    audioSourcesRef.current = [];
+  }, []);
+
+  const stopRenderLoop = useCallback(() => {
     if (renderTimerRef.current !== null) {
       window.cancelAnimationFrame(renderTimerRef.current);
       renderTimerRef.current = null;
@@ -140,54 +174,27 @@ function App() {
     fpsSamplesRef.current = [];
   }, []);
 
-  const playPcm16Audio = useCallback(async (base64Pcm: string, sampleRate: number, startDelayMs: number = 0) => {
-    try {
-      const binary = atob(base64Pcm);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i += 1) {
-        bytes[i] = binary.charCodeAt(i);
-      }
-
-      const pcm = new Int16Array(bytes.buffer);
-      const audioData = new Float32Array(pcm.length);
-      for (let i = 0; i < pcm.length; i += 1) {
-        audioData[i] = pcm[i] / 32768;
-      }
-
-      if (!audioCtxRef.current) {
-        audioCtxRef.current = new AudioContext();
-      }
-      const ctx = audioCtxRef.current;
-      if (ctx.state === 'suspended') {
-        await ctx.resume();
-      }
-
-      if (audioSourceRef.current) {
-        try {
-          audioSourceRef.current.stop();
-        } catch {
-          // ignore
-        }
-        audioSourceRef.current.disconnect();
-        audioSourceRef.current = null;
-      }
-
-      const buffer = ctx.createBuffer(1, audioData.length, sampleRate);
-      buffer.getChannelData(0).set(audioData);
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      const safeDelayMs = Math.max(0, startDelayMs);
-      const startAt = ctx.currentTime + safeDelayMs / 1000;
-      source.start(startAt);
-      audioSourceRef.current = source;
-      const baseLatencyMs = Math.max(0, Math.round((ctx.baseLatency || 0) * 1000));
-      return safeDelayMs + baseLatencyMs;
-    } catch (err) {
-      console.error('Audio playback failed:', err);
-      return 0;
+  const resetPlaybackState = useCallback((stopAudio: boolean) => {
+    frameQueueRef.current = [];
+    stableFramesRef.current = [];
+    stableAudioChunksRef.current = [];
+    pendingRealtimeAudioChunksRef.current = [];
+    firstFrameSeenRef.current = false;
+    audioBaseCtxTimeSecRef.current = null;
+    audioBasePtsMsRef.current = 0;
+    nextAudioScheduleTimeSecRef.current = 0;
+    droppedFramesRef.current = 0;
+    lateAudioChunksRef.current = 0;
+    setDroppedFrames(0);
+    setLateAudioChunks(0);
+    setAudioNowMs(0);
+    setVideoQueueLen(0);
+    setSyncOffsetEstimateMs(0);
+    if (stopAudio) {
+      stopAllAudioSources();
     }
-  }, []);
+    stopRenderLoop();
+  }, [stopAllAudioSources, stopRenderLoop]);
 
   const ensureAudioReady = useCallback(async () => {
     if (!audioCtxRef.current) {
@@ -199,20 +206,160 @@ function App() {
     }
   }, []);
 
-  const startRenderLoop = useCallback((startDelayMs: number = 0) => {
-    if (renderTimerRef.current !== null || renderStartTimerRef.current !== null) return;
+  const scheduleAudioChunk = useCallback(async (chunk: AudioChunkMessage, firstDelayMs?: number) => {
+    try {
+      await ensureAudioReady();
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+
+      const binary = atob(chunk.data);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      const pcm = new Int16Array(bytes.buffer);
+      const audioData = new Float32Array(pcm.length);
+      for (let i = 0; i < pcm.length; i += 1) {
+        audioData[i] = pcm[i] / 32768;
+      }
+
+      const buffer = ctx.createBuffer(1, audioData.length, chunk.sample_rate);
+      buffer.getChannelData(0).set(audioData);
+
+      if (audioBaseCtxTimeSecRef.current === null) {
+        const fallbackDelay = playModeRef.current === 'stable'
+          ? STABLE_SYNC_START_DELAY_MS
+          : REALTIME_SYNC_START_DELAY_MS;
+        const leadMs = Math.max(0, firstDelayMs ?? fallbackDelay);
+        const baseCtxTime = ctx.currentTime + leadMs / 1000;
+        audioBaseCtxTimeSecRef.current = baseCtxTime;
+        audioBasePtsMsRef.current = chunk.pts_ms;
+        nextAudioScheduleTimeSecRef.current = baseCtxTime;
+      }
+
+      const baseCtxTime = audioBaseCtxTimeSecRef.current;
+      if (baseCtxTime === null) return;
+
+      const targetStartSec = baseCtxTime + (chunk.pts_ms - audioBasePtsMsRef.current) / 1000;
+      let startSec = Math.max(nextAudioScheduleTimeSecRef.current, targetStartSec);
+      if (startSec < ctx.currentTime - 0.02) {
+        lateAudioChunksRef.current += 1;
+        setLateAudioChunks(lateAudioChunksRef.current);
+        startSec = ctx.currentTime;
+      }
+
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.onended = () => {
+        audioSourcesRef.current = audioSourcesRef.current.filter((s) => s !== source);
+        source.disconnect();
+      };
+      audioSourcesRef.current.push(source);
+      source.start(startSec);
+      nextAudioScheduleTimeSecRef.current = startSec + buffer.duration;
+    } catch (err) {
+      console.error('Audio chunk schedule failed:', err);
+    }
+  }, [ensureAudioReady]);
+
+  const scheduleAudioChunks = useCallback(async (chunks: AudioChunkMessage[], firstDelayMs?: number) => {
+    if (chunks.length === 0) return;
+    const ordered = [...chunks].sort((a, b) => (
+      a.pts_ms - b.pts_ms || a.seq - b.seq
+    ));
+    for (let i = 0; i < ordered.length; i += 1) {
+      await scheduleAudioChunk(ordered[i], i === 0 ? firstDelayMs : undefined);
+    }
+  }, [scheduleAudioChunk]);
+
+  const getAudioNowMs = useCallback((): number | null => {
+    const ctx = audioCtxRef.current;
+    const baseCtx = audioBaseCtxTimeSecRef.current;
+    if (!ctx || baseCtx === null) return null;
+    return (ctx.currentTime - baseCtx) * 1000 + audioBasePtsMsRef.current;
+  }, []);
+
+  const enqueueVideoFrame = useCallback((frame: QueuedFrame) => {
+    const queue = frameQueueRef.current;
+    if (queue.length === 0 || queue[queue.length - 1].ptsMs <= frame.ptsMs) {
+      queue.push(frame);
+    } else {
+      let inserted = false;
+      for (let i = 0; i < queue.length; i += 1) {
+        if (frame.ptsMs < queue[i].ptsMs) {
+          queue.splice(i, 0, frame);
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) {
+        queue.push(frame);
+      }
+    }
+
+    if (queue.length > MAX_BUFFERED_FRAMES) {
+      const overflow = queue.length - MAX_BUFFERED_FRAMES;
+      queue.splice(0, overflow);
+      droppedFramesRef.current += overflow;
+      setDroppedFrames(droppedFramesRef.current);
+    }
+    setVideoQueueLen(queue.length);
+  }, []);
+
+  const startRenderLoop = useCallback(() => {
+    if (renderTimerRef.current !== null) return;
 
     const tick = (ts: number) => {
-      const dt = ts - lastRenderTsRef.current;
       const queue = frameQueueRef.current;
-      const effectiveFps = Math.max(1, serverFpsRef.current || renderFpsRef.current);
-      const frameMs = 1000 / effectiveFps;
+      const audioNow = getAudioNowMs();
+      if (audioNow !== null) {
+        setAudioNowMs(Math.round(audioNow));
+      }
 
-      if (dt >= frameMs && queue.length > 0) {
-        const frame = queue.shift();
-        if (frame) {
-          drawFrame(frame);
-          lastRenderTsRef.current = ts;
+      let droppedNow = 0;
+      if (audioNow !== null) {
+        while (queue.length > 0 && queue[0].ptsMs < audioNow - VIDEO_LATE_DROP_MS) {
+          queue.shift();
+          droppedNow += 1;
+        }
+      }
+      if (droppedNow > 0) {
+        droppedFramesRef.current += droppedNow;
+        setDroppedFrames(droppedFramesRef.current);
+      }
+
+      let frameToRender: QueuedFrame | null = null;
+      if (queue.length > 0) {
+        if (audioNow === null) {
+          frameToRender = queue.shift() ?? null;
+        } else {
+          let lastEligibleIdx = -1;
+          for (let i = 0; i < queue.length; i += 1) {
+            if (queue[i].ptsMs <= audioNow + VIDEO_EARLY_RENDER_MS) {
+              lastEligibleIdx = i;
+            } else {
+              break;
+            }
+          }
+          if (lastEligibleIdx >= 0) {
+            frameToRender = queue[lastEligibleIdx];
+            if (lastEligibleIdx > 0) {
+              droppedFramesRef.current += lastEligibleIdx;
+              setDroppedFrames(droppedFramesRef.current);
+            }
+            queue.splice(0, lastEligibleIdx + 1);
+          }
+        }
+      }
+
+      if (frameToRender) {
+        drawFrame(frameToRender.data);
+        if (audioNow !== null) {
+          setSyncOffsetEstimateMs(Math.round(frameToRender.ptsMs - audioNow));
+        }
+        if (lastRenderTsRef.current > 0) {
+          const dt = ts - lastRenderTsRef.current;
           const instantFps = dt > 0 ? 1000 / dt : renderFpsRef.current;
           fpsSamplesRef.current.push(instantFps);
           if (fpsSamplesRef.current.length > 20) {
@@ -221,8 +368,10 @@ function App() {
           const avg = fpsSamplesRef.current.reduce((a, b) => a + b, 0) / Math.max(1, fpsSamplesRef.current.length);
           setDisplayFps(Math.round(avg));
         }
+        lastRenderTsRef.current = ts;
       }
 
+      setVideoQueueLen(queue.length);
       if (queue.length > 0 || streamStateRef.current === 'streaming') {
         renderTimerRef.current = window.requestAnimationFrame(tick);
       } else {
@@ -230,23 +379,9 @@ function App() {
       }
     };
 
-    const begin = () => {
-      if (renderTimerRef.current !== null) return;
-      lastRenderTsRef.current = performance.now();
-      renderTimerRef.current = window.requestAnimationFrame(tick);
-    };
-
-    const safeDelayMs = Math.max(0, startDelayMs);
-    if (safeDelayMs > 0) {
-      renderStartTimerRef.current = window.setTimeout(() => {
-        renderStartTimerRef.current = null;
-        begin();
-      }, safeDelayMs);
-      return;
-    }
-
-    begin();
-  }, [drawFrame]);
+    lastRenderTsRef.current = performance.now();
+    renderTimerRef.current = window.requestAnimationFrame(tick);
+  }, [drawFrame, getAudioNowMs]);
 
   const sendSessionInit = useCallback((ws: WebSocket, voice: string) => {
     ws.send(
@@ -278,12 +413,7 @@ function App() {
       setStatus('连接断开，重连中');
       setStreamState('idle');
       streamStateRef.current = 'idle';
-      pendingAudioRef.current = null;
-      stableFramesRef.current = [];
-      audioStartedRef.current = false;
-      firstFrameSeenRef.current = false;
-      frameQueueRef.current = [];
-      stopRenderLoop();
+      resetPlaybackState(true);
       if (shouldReconnectRef.current && reconnectTimerRef.current === null) {
         reconnectTimerRef.current = window.setTimeout(() => {
           reconnectTimerRef.current = null;
@@ -324,26 +454,24 @@ function App() {
           return;
         }
 
-        if (msg.type === 'audio.pcm') {
-          pendingAudioRef.current = { data: msg.data, sampleRate: msg.sample_rate };
-          if (
-            playModeRef.current === 'realtime'
-            && firstFrameSeenRef.current
-            && !audioStartedRef.current
-          ) {
-            audioStartedRef.current = true;
-            playPcm16Audio(msg.data, msg.sample_rate);
+        if (msg.type === 'audio.chunk') {
+          if (playModeRef.current === 'stable') {
+            stableAudioChunksRef.current.push(msg);
+            return;
+          }
+          if (!firstFrameSeenRef.current) {
+            pendingRealtimeAudioChunksRef.current.push(msg);
+          } else {
+            void scheduleAudioChunk(msg);
           }
           return;
         }
 
         if (msg.type === 'video.frame') {
-          if (typeof msg.fps === 'number' && msg.fps > 0) {
-            serverFpsRef.current = msg.fps;
-          }
+          const frame: QueuedFrame = { seq: msg.seq, ptsMs: msg.pts_ms, data: msg.data };
 
           if (playModeRef.current === 'stable') {
-            stableFramesRef.current.push(msg.data);
+            stableFramesRef.current.push(frame);
             setStreamState('streaming');
             setStatus(`稳定模式生成中：已缓存 ${stableFramesRef.current.length} 帧`);
             return;
@@ -351,15 +479,12 @@ function App() {
 
           if (!firstFrameSeenRef.current) {
             firstFrameSeenRef.current = true;
-            if (!audioStartedRef.current && pendingAudioRef.current) {
-              audioStartedRef.current = true;
-              playPcm16Audio(pendingAudioRef.current.data, pendingAudioRef.current.sampleRate);
-            }
+            const buffered = pendingRealtimeAudioChunksRef.current;
+            pendingRealtimeAudioChunksRef.current = [];
+            void scheduleAudioChunks(buffered, REALTIME_SYNC_START_DELAY_MS);
           }
-          if (frameQueueRef.current.length >= MAX_BUFFERED_FRAMES) {
-            frameQueueRef.current.shift();
-          }
-          frameQueueRef.current.push(msg.data);
+
+          enqueueVideoFrame(frame);
           setStreamState('streaming');
           setStatus(`流式生成中，缓冲 ${frameQueueRef.current.length} 帧`);
           startRenderLoop();
@@ -373,43 +498,28 @@ function App() {
           setRealTimeRatio(Number(msg.real_time_ratio || 0));
 
           if (playModeRef.current === 'stable' && !msg.cancelled) {
-            if (typeof msg.fps === 'number' && msg.fps > 0) {
-              serverFpsRef.current = msg.fps;
-            }
-            frameQueueRef.current = [...stableFramesRef.current];
+            const frames = [...stableFramesRef.current].sort((a, b) => (
+              a.ptsMs - b.ptsMs || a.seq - b.seq
+            ));
+            const audioChunks = [...stableAudioChunksRef.current].sort((a, b) => (
+              a.pts_ms - b.pts_ms || a.seq - b.seq
+            ));
             stableFramesRef.current = [];
-            firstFrameSeenRef.current = false;
+            stableAudioChunksRef.current = [];
+            frameQueueRef.current = frames;
+            setVideoQueueLen(frames.length);
             setStatus(`稳定模式播放中：${msg.total_frames} 帧 / ${msg.elapsed_ms}ms`);
-
-            const startStablePlayback = async () => {
-              let renderDelayMs = 0;
-              if (pendingAudioRef.current && !audioStartedRef.current) {
-                audioStartedRef.current = true;
-                renderDelayMs = await playPcm16Audio(
-                  pendingAudioRef.current.data,
-                  pendingAudioRef.current.sampleRate,
-                  STABLE_SYNC_START_DELAY_MS,
-                );
-              }
-              pendingAudioRef.current = null;
-
-              if (frameQueueRef.current.length > 0) {
-                startRenderLoop(renderDelayMs);
-              } else {
-                stopRenderLoop();
-              }
-            };
-            void startStablePlayback();
+            void scheduleAudioChunks(audioChunks, STABLE_SYNC_START_DELAY_MS);
+            startRenderLoop();
           } else {
             setStatus(
               msg.cancelled
                 ? '流已取消'
                 : `生成完成：${msg.total_frames} 帧 / ${msg.elapsed_ms}ms`,
             );
-            pendingAudioRef.current = null;
             stableFramesRef.current = [];
-            audioStartedRef.current = false;
-            firstFrameSeenRef.current = false;
+            stableAudioChunksRef.current = [];
+            pendingRealtimeAudioChunksRef.current = [];
             if (frameQueueRef.current.length === 0) {
               stopRenderLoop();
             }
@@ -422,11 +532,8 @@ function App() {
           setLastErrorCode(msg.code || 'UNKNOWN');
           setStreamState('idle');
           streamStateRef.current = 'idle';
-          pendingAudioRef.current = null;
-          stableFramesRef.current = [];
-          audioStartedRef.current = false;
-          firstFrameSeenRef.current = false;
           setStatus('发生错误');
+          resetPlaybackState(true);
         }
       } catch (err) {
         console.error('Failed to parse WS message:', err);
@@ -434,7 +541,15 @@ function App() {
     };
 
     wsRef.current = ws;
-  }, [playPcm16Audio, sendSessionInit, startRenderLoop, stopRenderLoop]);
+  }, [
+    enqueueVideoFrame,
+    resetPlaybackState,
+    scheduleAudioChunk,
+    scheduleAudioChunks,
+    sendSessionInit,
+    startRenderLoop,
+    stopRenderLoop,
+  ]);
 
   useEffect(() => {
     renderFpsRef.current = renderFps;
@@ -461,14 +576,7 @@ function App() {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
-      stopRenderLoop();
-      if (audioSourceRef.current) {
-        try {
-          audioSourceRef.current.stop();
-        } catch {
-          // ignore
-        }
-      }
+      resetPlaybackState(true);
       if (audioCtxRef.current) {
         audioCtxRef.current.close().catch(() => undefined);
       }
@@ -476,7 +584,7 @@ function App() {
         wsRef.current.close();
       }
     };
-  }, [connectWebSocket, stopRenderLoop]);
+  }, [connectWebSocket, resetPlaybackState]);
 
   const sendText = useCallback((payloadText: string) => {
     const ws = wsRef.current;
@@ -493,8 +601,7 @@ function App() {
       return;
     }
 
-    frameQueueRef.current = [];
-    stableFramesRef.current = [];
+    resetPlaybackState(true);
     setDisplayFps(0);
     setQueueDepth(0);
     setEstimatedLatencyMs(0);
@@ -505,22 +612,18 @@ function App() {
     setStatus('请求 TTS 并开始流式生成');
     setStreamState('streaming');
     streamStateRef.current = 'streaming';
-    serverFpsRef.current = renderFpsRef.current;
-    pendingAudioRef.current = null;
-    audioStartedRef.current = false;
-    firstFrameSeenRef.current = false;
 
     ws.send(
       JSON.stringify({
         type: 'tts.request',
         text: payloadText,
         voice: selectedVoice,
-        chunk_ms: 80,
+        chunk_ms: AUDIO_CHUNK_MS,
         render_fps: renderFpsRef.current,
         play_mode: playModeRef.current,
       }),
     );
-  }, [selectedVoice, sessionState]);
+  }, [resetPlaybackState, selectedVoice, sessionState]);
 
   const handleSend = useCallback(() => {
     const trimmed = text.trim();
@@ -548,15 +651,11 @@ function App() {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify({ type: 'stream.cancel' }));
-    frameQueueRef.current = [];
-    stableFramesRef.current = [];
     setStreamState('idle');
     streamStateRef.current = 'idle';
-    pendingAudioRef.current = null;
-    firstFrameSeenRef.current = false;
-    audioStartedRef.current = false;
     setStatus('已请求取消');
-  }, []);
+    resetPlaybackState(true);
+  }, [resetPlaybackState]);
 
   const handleVoiceChange = useCallback((voice: string) => {
     setSelectedVoice(voice);
@@ -683,6 +782,11 @@ function App() {
                 <li>实时比: {realTimeRatio.toFixed(2)}x</li>
                 <li>队列深度: {queueDepth}</li>
                 <li>估计延迟: {estimatedLatencyMs} ms</li>
+                <li>audio_now_ms: {audioNowMs}</li>
+                <li>video_queue_len: {videoQueueLen}</li>
+                <li>dropped_frames: {droppedFrames}</li>
+                <li>late_audio_chunks: {lateAudioChunks}</li>
+                <li>sync_offset_estimate_ms: {syncOffsetEstimateMs}</li>
                 <li>最近错误码: {lastErrorCode}</li>
               </ul>
             </div>

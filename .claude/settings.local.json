@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \" import sys, json for line in sys.stdin: line = line.strip\\(\\) if not line: continue try: obj = json.loads\\(line\\) role = obj.get\\(''type'', ''''\\) if role == ''user'': msg = obj.get\\(''message'', {}\\) content = msg.get\\(''content'', ''''\\) if isinstance\\(content, list\\): for c in content: if isinstance\\(c, dict\\) and c.get\\(''type''\\) == ''text'': print\\(f''[USER] {c[\"\"text\"\"][:200]}''\\) elif isinstance\\(content, str\\): print\\(f''[USER] {content[:200]}''\\) elif role == ''assistant'': msg = obj.get\\(''message'', {}\\) content = msg.get\\(''content'', ''''\\) if isinstance\\(content, list\\): for c in content: if isinstance\\(c, dict\\) and c.get\\(''type''\\) == ''text'': print\\(f''[ASSISTANT] {c[\"\"text\"\"][:200]}''\\) elif isinstance\\(content, str\\): print\\(f''[ASSISTANT] {content[:200]}''\\) except: pass \")"
+    ]
+  }
+}
